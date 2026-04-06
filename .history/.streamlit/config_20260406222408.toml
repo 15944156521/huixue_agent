@@ -1,0 +1,15 @@
+[theme]
+primaryColor = "#2f54eb"
+backgroundColor = "#f5f7fb"
+secondaryBackgroundColor = "#eef2ff"
+textColor = "#172554"
+font = "sans serif"
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[server]
+port = 8501
+headless = true
+runOnSave = true
