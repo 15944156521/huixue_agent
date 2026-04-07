@@ -1,0 +1,13 @@
+[server]
+# 监听所有网络接口
+address = "0.0.0.0"
+port = 8501
+headless = true
+
+[client]
+# 允许来自任何来源的请求
+showErrorDetails = true
+toolbarMode = "viewer"
+
+[logger]
+level = "info"
