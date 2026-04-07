@@ -1,7 +1,9 @@
+import os
+
 from services.study_planner_service import StudyPlannerService
 
 
-API_KEY = "sk-f2ea0277b95141aba33bd194d4dee28b"
+API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 
 if __name__ == "__main__":

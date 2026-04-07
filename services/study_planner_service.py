@@ -2,12 +2,14 @@ import json
 from datetime import date
 
 from agents.input_parser import InputParser
-from agents.info_validator import InfoValidator
-from agents.plan_validator import PlanValidator
 from agents.evaluation_agent import EvaluationAgent
 from agents.optimization_agent import OptimizationAgent
 from agents.plan_agent import PlanAgent
-from graph.workflows import build_adjust_workflow, build_plan_workflow
+from graph.workflows import (
+    build_adjust_workflow,
+    build_plan_workflow,
+    build_plan_workflow_from_parsed,
+)
 from rag.retriever import KnowledgeRetriever
 from services.schedule import (
     current_plan_day_index,
@@ -19,6 +21,11 @@ from services.schedule import (
 )
 from storage.db import init_db
 from storage.repository import StudyRepository
+from utils.goal_validation import (
+    goal_missing_fields_for_submission,
+    normalize_parsed_goal,
+    validate_parsed_goal,
+)
 
 
 def _progress_for_prompt(progress: dict) -> dict:
@@ -34,8 +41,6 @@ class StudyPlannerService:
         init_db()
         self.user_id = user_id
         self.parser = InputParser(api_key)
-        self.validator = InfoValidator(api_key)
-        self.plan_validator = PlanValidator(strict_mode=False)
         self.planner = PlanAgent(api_key)
         self.evaluator = EvaluationAgent(api_key)
         self.optimizer = OptimizationAgent(api_key)
@@ -44,146 +49,45 @@ class StudyPlannerService:
         self._plan_workflow = build_plan_workflow(
             self.parser, self.planner, self.retriever
         )
+        self._plan_workflow_from_parsed = build_plan_workflow_from_parsed(
+            self.planner, self.retriever
+        )
         self._adjust_workflow = build_adjust_workflow(
             self.optimizer, self.retriever
         )
 
-    def check_input_completeness(self, user_input: str):
-        """
-        检查用户输入的完整性。
-        返回: {
-            "completeness_score": int,
-            "is_complete": bool,  # 是否信息充分
-            "critical_missing": list,  # 关键缺失字段
-            "optional_missing": list,  # 可选缺失字段
-            "analysis": str,
-            "followup_questions": list  # 如果不完整，包含后续问题
-        }
-        """
-        completeness = self.validator.check_completeness(user_input)
-        score = completeness.get("completeness_score", 50)
-        critical = completeness.get("critical_missing", [])
-        optional = completeness.get("optional_missing", [])
-        
-        result = {
-            "completeness_score": score,
-            "is_complete": score >= 85,
-            "critical_missing": critical,
-            "optional_missing": optional,
-            "analysis": completeness.get("analysis", ""),
-            "followup_questions": []
-        }
-        
-        # 如果信息不充分，生成后续问题
-        if not result["is_complete"]:
-            all_missing = critical + optional
-            questions = self.validator.generate_followup_questions(user_input, all_missing)
-            result["followup_questions"] = questions
-        
-        return result
+    def parse_user_goal(self, user_input):
+        """仅调用第一个智能体，返回规范化后的结构化目标（不写入数据库）。"""
+        text = (user_input or "").strip()
+        raw = self.parser.parse(text) if text else {}
+        return normalize_parsed_goal(raw)
 
-    def enrich_input_with_answers(self, 
-                                   original_input: str, 
-                                   followup_qa: list) -> tuple[str, dict]:
+    def goal_missing_fields(self, parsed_goal, user_input: str | None = None):
         """
-        将多轮交互答案整合到原始输入，生成增强后的用户描述。
-        followup_qa: [{"field": "...", "question": "...", "answer": "..."}, ...]
-        返回: (增强后的用户描述, 完整的解析结果)
+        返回仍需用户补充的字段名列表。
+        若提供 user_input，会结合原文判断模型是否「臆测」了周期/时长/重点，从而触发交互补全。
         """
-        if not followup_qa or not any(qa.get("answer") for qa in followup_qa):
-            # 没有有效的补充答案，使用原始输入
-            return original_input, self.parser.parse(original_input)
-        
-        # 获取增强后的用户描述
-        integrated_description = self.validator.integrate_followup_answer(
-            original_input, 
-            followup_qa
-        )
-        
-        # 使用增强描述进行解析
-        parsed_goal = self.parser.parse_enriched(integrated_description)
-        
-        return integrated_description, parsed_goal
+        if user_input is None:
+            return validate_parsed_goal(parsed_goal)
+        return goal_missing_fields_for_submission(user_input, parsed_goal)
 
-    def create_plan_with_interaction(self, user_input: str, 
-                                      followup_qa: list = None,
-                                      plan_start_date=None):
-        """
-        支持多轮交互的计划生成。
-        流程：检查完整性 → 如果需要，进行多轮交互 → 生成完整计划
-        
-        Args:
-            user_input: 初始用户输入
-            followup_qa: 可选的后续问答数组，用于多轮交互补全
-            plan_start_date: 计划开始日期
-            
-        返回: {
-            "completeness": {
-                "score": int,
-                "is_complete": bool,
-                "questions_asked": list  # 向用户提出的问题
-            },
-            "enriched_input": str,  # 增强后的用户描述
-            "plan": dict,  # 生成的计划
-            "rag_context": str  # 检索到的知识库文本
-        }
-        """
-        # 第一步：检查完整性
-        completeness = self.check_input_completeness(user_input)
-        
-        # 第二步：如果信息不完整但已有后续答案，则补全
-        enriched_input = user_input
-        if followup_qa:
-            enriched_input, _ = self.enrich_input_with_answers(user_input, followup_qa)
-        
-        # 第三步：用（可能增强的）输入生成计划
-        workflow_out = self._plan_workflow.invoke(
-            {"user_input": enriched_input.strip()}
-        )
-        parsed_goal = workflow_out.get("parsed_goal") or {}
-        plan_data = workflow_out.get("plan_data") or {}
-        
-        if plan_start_date is None:
-            start_str = date.today().isoformat()
-        elif isinstance(plan_start_date, date):
-            start_str = plan_start_date.isoformat()
-        else:
-            start_str = str(plan_start_date)[:10]
-            
-        plan_id = self.repo.create_study_plan(
-            user_id=self.user_id,
-            raw_input=user_input,
-            parsed_goal=parsed_goal,
-            plan_data=plan_data,
-            plan_start_date=start_str,
-        )
-        plan = self.repo.get_plan_by_id(plan_id)
-        rag_context = workflow_out.get("rag_context") or ""
-        
-        # 第四步：验证生成的计划是否合理
-        validation_result = self.plan_validator.validate(parsed_goal, plan_data)
-        
-        return {
-            "completeness": {
-                "score": completeness["completeness_score"],
-                "is_complete": completeness["is_complete"],
-                "analysis": completeness["analysis"],
-                "questions_asked": completeness.get("followup_questions", [])
-            },
-            "enriched_input": enriched_input,
-            "plan": plan,
-            "rag_context": rag_context,
-            "validation": validation_result  # ← 新增验证结果
-        }
-
-    def create_plan(self, user_input, plan_start_date=None):
+    def create_plan(self, user_input, plan_start_date=None, parsed_goal=None):
         """
         plan_start_date: date 或可解析的 ISO 字符串；表示「计划第 1 天」对应日历上的哪一天。
+        parsed_goal: 若已完整（含用户补充），则跳过解析节点，直接从 RAG + 计划生成执行。
         """
-        workflow_out = self._plan_workflow.invoke(
-            {"user_input": (user_input or "").strip()}
-        )
-        parsed_goal = workflow_out.get("parsed_goal") or {}
+        user_input = (user_input or "").strip()
+        if parsed_goal is not None:
+            normalized_goal = normalize_parsed_goal(parsed_goal)
+            if validate_parsed_goal(normalized_goal):
+                raise ValueError("parsed_goal 不完整，请先补充必填项")
+            workflow_out = self._plan_workflow_from_parsed.invoke(
+                {"user_input": user_input, "parsed_goal": normalized_goal}
+            )
+            final_parsed_goal = normalized_goal
+        else:
+            workflow_out = self._plan_workflow.invoke({"user_input": user_input})
+            final_parsed_goal = workflow_out.get("parsed_goal") or {}
         plan_data = workflow_out.get("plan_data") or {}
         if plan_start_date is None:
             start_str = date.today().isoformat()
@@ -194,7 +98,7 @@ class StudyPlannerService:
         plan_id = self.repo.create_study_plan(
             user_id=self.user_id,
             raw_input=user_input,
-            parsed_goal=parsed_goal,
+            parsed_goal=final_parsed_goal,
             plan_data=plan_data,
             plan_start_date=start_str,
         )
