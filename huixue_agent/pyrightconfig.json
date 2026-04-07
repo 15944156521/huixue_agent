@@ -1,8 +1,0 @@
-{
-  "include": [
-    "."
-  ],
-  "extraPaths": [
-    "/Users/tiantianlu/miniconda3/lib/python3.11/site-packages"
-  ]
-}
